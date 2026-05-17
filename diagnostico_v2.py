@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """
 diagnostico_v2.py - Diagnóstico para Teleprompter v3
-Pruebas de audio y Vosk antes de ejecutar el sistema completo.
+Pruebas de audio y Vosk con resampling en tiempo real usando scipy.
 
 Uso:
-    python3 diagnostico_v2.py --test-pipeline
+    python3 diagnostico_v2.py --test-audio
     python3 diagnostico_v2.py --test-vosk
-    python3 diagnostico_v2.py --test-pipeline --test-vosk
+    python3 diagnostico_v2.py --test-realtime
 """
 
 import sys
@@ -17,18 +17,21 @@ import tempfile
 import wave
 import json
 import time
+import threading
 import numpy as np
+from scipy.signal import resample
+import sounddevice as sd
 from vosk import Model, KaldiRecognizer, SetLogLevel
 
 SetLogLevel(-1)
 
 # --- Constantes ---
-MIC_DEVICE = "plughw:2,0"
-MIC_SAMPLERATE = 44100
-VOSK_SAMPLERATE = 16000
+SAMPLE_RATE_DEV = 44100
+SAMPLE_RATE_VOSK = 16000
+BLOCK_SIZE = 4410  # 100ms
 MODEL_PATH = "modelo"
 GAIN_DEFAULT = -24
-PIPELINE_DURATION = 5
+TEST_DURATION = 5
 
 
 # --- Utilidades ---
@@ -53,85 +56,65 @@ def print_stats(audio: np.ndarray, label=""):
     print(f"  {label:20s}  Max: {m:6d}  RMS: {r:7.1f}  Clip%: {c:5.2f}  [{status}]")
 
 
-# --- Pipeline de audio ---
-def run_pipeline(duration=PIPELINE_DURATION, gain=GAIN_DEFAULT, output_file="/tmp/test_pipeline.wav"):
-    """Ejecuta arecord | sox y guarda el resultado como WAV."""
-    print(f"\n-- TEST PIPELINE arecord -> sox --")
-    print(f"  Duracion: {duration}s  Gain: {gain}dB  Output: {output_file}")
+# --- Test Audio (graba 5s y analiza) ---
+def test_audio():
+    """Graba 5 segundos y muestra estadísticas del audio."""
+    print(f"\n-- TEST AUDIO ({TEST_DURATION}s) --")
+    print("  Habla ahora...")
 
-    arecord_cmd = [
-        'arecord', '-D', MIC_DEVICE,
-        '-f', 'S16_LE',
-        '-r', str(MIC_SAMPLERATE),
-        '-c', '1',
-        '-t', 'raw',
-        '-'
-    ]
+    audio_data = []
+    device = None
 
-    sox_cmd = [
-        'sox', '-t', 'raw', '-r', str(MIC_SAMPLERATE),
-        '-e', 'signed', '-b', '16', '-c', '1', '-',
-        '-t', 'raw', '-r', '16000',
-        '-e', 'signed', '-b', '16', '-c', '1',
-        'gain', str(gain),
-        'highpass', '200',
-        'lowpass', '3200',
-        '-'
-    ]
+    for i, dev in enumerate(sd.query_devices()):
+        if 'USB' in dev['name'] and dev['max_input_channels'] > 0:
+            device = i
+            break
 
-    print("  Grabando... (habla ahora)")
-    try:
-        proc_arecord = subprocess.Popen(
-            arecord_cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL
-        )
+    if device is None:
+        print("  ERROR: No se encontró micrófono USB")
+        return
 
-        proc_sox = subprocess.Popen(
-            sox_cmd,
-            stdin=proc_arecord.stdout,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL
-        )
+    print(f"  Dispositivo: {device}")
 
-        proc_arecord.stdout.close()
+    def callback(indata, frames, time_info, status):
+        if status:
+            print(f"  status: {status}")
+        audio_data.append(indata[:, 0].copy())
 
-        audio_data = b''
-        start = time.time()
+    stream = sd.InputStream(
+        device=device,
+        samplerate=SAMPLE_RATE_DEV,
+        blocksize=BLOCK_SIZE,
+        dtype='int16',
+        channels=1,
+        callback=callback
+    )
 
-        while time.time() - start < duration:
-            chunk = proc_sox.stdout.read(3200)
-            if not chunk:
-                break
-            audio_data += chunk
-
-        proc_arecord.terminate()
-        proc_sox.terminate()
-
-    except Exception as e:
-        print(f"  ERROR: {e}")
-        return None
+    with stream:
+        sd.sleep(TEST_DURATION * 1000)
 
     if not audio_data:
-        print("  ERROR: No se capturo audio")
-        return None
+        print("  ERROR: No se capturó audio")
+        return
 
-    print(f"  Audio capturado: {len(audio_data)} bytes")
+    all_audio = np.concatenate(audio_data)
+    print_stats(all_audio, f"Audio ({TEST_DURATION}s)")
 
-    # Guardar como WAV
+    # Guardar WAV
+    output_file = "/tmp/test_audio.wav"
     with wave.open(output_file, 'wb') as wf:
         wf.setnchannels(1)
         wf.setsampwidth(2)
-        wf.setframerate(VOSK_SAMPLERATE)
-        wf.writeframes(audio_data)
-
+        wf.setframerate(SAMPLE_RATE_DEV)
+        wf.writeframes(all_audio.tobytes())
     print(f"  Guardado en: {output_file}")
-    return audio_data
+
+    return all_audio
 
 
-# --- Test Vosk ---
-def test_vosk(wav_file="/tmp/test_pipeline.wav", model_path=MODEL_PATH):
-    """Prueba reconocimiento Vosk con un archivo WAV."""
+# --- Test Vosk (con archivo WAV) ---
+def test_vosk(wav_file="/tmp/test_audio.wav", model_path=MODEL_PATH):
+    """Prueba reconocimiento Vosk con un archivo WAV y resampling."""
     print(f"\n-- TEST VOSK --")
     print(f"  Archivo: {wav_file}")
     print(f"  Modelo: {model_path}")
@@ -140,31 +123,34 @@ def test_vosk(wav_file="/tmp/test_pipeline.wav", model_path=MODEL_PATH):
         print(f"  ERROR: No existe {wav_file}")
         return
 
-    # Cargar modelo
     print("  Cargando modelo...")
     try:
         model = Model(model_path)
-        rec = KaldiRecognizer(model, VOSK_SAMPLERATE)
+        rec = KaldiRecognizer(model, SAMPLE_RATE_VOSK)
         print("  Modelo cargado")
     except Exception as e:
-        print(f"  ERROR cargando modelo: {e}")
+        print(f"  ERROR: {e}")
         return
 
-    # Leer WAV
     with wave.open(wav_file, 'rb') as wf:
-        audio = wf.readframes(wf.getnframes())
+        audio_44100 = wf.readframes(wf.getnframes())
 
-    print(f"  Audio: {len(audio)} bytes")
-    audio_np = np.frombuffer(audio, dtype=np.int16)
-    print_stats(audio_np, "Audio 16kHz")
+    audio_44100_np = np.frombuffer(audio_44100, dtype=np.int16)
+    print_stats(audio_44100_np, "Audio 44100Hz")
 
-    # Reconocer
+    # Resample a 16000
+    num_out = int(len(audio_44100_np) * SAMPLE_RATE_VOSK / SAMPLE_RATE_DEV)
+    resampled = resample(audio_44100_np.astype(np.float32), num_out)
+    audio_16000 = np.clip(resampled, -32768, 32767).astype(np.int16)
+
+    print_stats(audio_16000, "Audio 16000Hz")
+
     print("  Reconociendo...")
     results = []
 
     chunk_size = 16000  # 1 segundo
-    for i in range(0, len(audio), chunk_size):
-        chunk = audio[i:i+chunk_size]
+    for i in range(0, len(audio_16000.tobytes()), chunk_size):
+        chunk = audio_16000.tobytes()[i:i+chunk_size]
         if len(chunk) == chunk_size:
             if rec.AcceptWaveform(chunk):
                 r = json.loads(rec.Result())
@@ -179,55 +165,106 @@ def test_vosk(wav_file="/tmp/test_pipeline.wav", model_path=MODEL_PATH):
     print()
     if results:
         texto = ' '.join(results)
-        print(f"  VOSK reconocio: '{texto}'")
+        print(f"  VOSK reconoció: '{texto}'")
     else:
-        print("  VOSK NO reconocio texto (audio puede ser silencioso o distorsionado)")
+        print("  VOSK NO reconoció texto (audio puede ser silencioso o distorsionado)")
 
 
-# --- Test de ganancia ---
-def test_gain_search():
-    """Busca el gain optimo probando varios valores."""
-    print("\n-- TEST GAIN SEARCH --")
-    print("  Probando gains de -12 a -36 dB...")
-    print()
+# --- Test Realtime (callback + resample + Vosk) ---
+def test_realtime(duration=15, model_path=MODEL_PATH):
+    """Test completo en tiempo real: audio -> resample -> Vosk."""
+    print(f"\n-- TEST REALTIME ({duration}s) --")
+    print("  Habla ahora...")
 
-    gains = range(-12, -37, -3)
-    mejor_gain = GAIN_DEFAULT
-    mejor_clip = 100.0
+    print("  Cargando modelo...")
+    try:
+        model = Model(model_path)
+        rec = KaldiRecognizer(model, SAMPLE_RATE_VOSK)
+        print("  Modelo cargado")
+    except Exception as e:
+        print(f"  ERROR: {e}")
+        return
 
-    for g in gains:
-        print(f"  Gain={g}dB:")
-        audio_data = run_pipeline(duration=2, gain=g, output_file=f"/tmp/test_gain_{g}.wav")
-        if audio_data:
-            audio_np = np.frombuffer(audio_data, dtype=np.int16)
-            clip = clipping_percent(audio_np)
-            max_v = max_val(audio_np)
-            print(f"    Max={max_v}  Clip%={clip:.2f}")
+    sentences = []
+    chunk_count = [0]
 
-            if clip < mejor_clip and max_v < 28000:
-                mejor_clip = clip
-                mejor_gain = g
+    def callback(indata, frames, time_info, status):
+        if status:
+            print(f"  status: {status}")
 
-        time.sleep(0.5)
+        chunk_44100 = indata[:, 0].astype(np.int16)
+        num_out = int(len(chunk_44100) * SAMPLE_RATE_VOSK / SAMPLE_RATE_DEV)
+        resampled = resample(chunk_44100.astype(np.float32), num_out)
+        chunk_16000 = np.clip(resampled, -32768, 32767).astype(np.int16)
 
-    print()
-    print(f"  MEJOR GAIN: {mejor_gain}dB (clipping: {mejor_clip:.2f}%)")
-    return mejor_gain
+        if rec.AcceptWaveform(chunk_16000.tobytes()):
+            result = json.loads(rec.Result())
+            text = result.get('text', '').strip()
+            if text and len(text) > 1:
+                sentences.append(text)
+                print(f"\n  [FRASE] {text}")
+        else:
+            partial = json.loads(rec.PartialResult())
+            ptext = partial.get('partial', '').strip()
+            if ptext and len(ptext) > 2:
+                print(f"\r  ... {ptext}", end="", flush=True)
+
+        chunk_count[0] += 1
+        if chunk_count[0] % 10 == 0:
+            energy = np.abs(chunk_44100).mean()
+            print(f"  [{chunk_count[0]*0.1:.1f}s] energia={energy:.0f}", end="\n")
+
+    device = None
+    for i, dev in enumerate(sd.query_devices()):
+        if 'USB' in dev['name'] and dev['max_input_channels'] > 0:
+            device = i
+            print(f"  Micrófono USB: {i} - {dev['name']}")
+            break
+
+    if device is None:
+        print("  ERROR: No se encontró micrófono USB")
+        return
+
+    stream = sd.InputStream(
+        device=device,
+        samplerate=SAMPLE_RATE_DEV,
+        blocksize=BLOCK_SIZE,
+        dtype='int16',
+        channels=1,
+        callback=callback
+    )
+
+    with stream:
+        sd.sleep(duration * 1000)
+
+    final = json.loads(rec.FinalResult())
+    ftext = final.get('text', '').strip()
+    if ftext:
+        sentences.append(ftext)
+
+    print(f"\n{'='*50}")
+    print(f"Frases reconocidas: {len(sentences)}")
+    for i, s in enumerate(sentences):
+        print(f"  {i+1}. {s}")
+    print(f"{'='*50}")
+
+    if len(sentences) > 0:
+        print("\nVosk funciona! El reconocimiento en tiempo real es consistente.")
+    else:
+        print("\nSin resultados. Verificar micrófono o acercarse más al hablar.")
 
 
 # --- Main ---
 def main():
     parser = argparse.ArgumentParser(description="Diagnostico v3 para Teleprompter")
-    parser.add_argument('--test-pipeline', action='store_true',
-                        help='Grabar 5s con pipeline arecord|sox y analizar audio')
+    parser.add_argument('--test-audio', action='store_true',
+                        help='Grabar audio y analizar')
     parser.add_argument('--test-vosk', action='store_true',
-                        help='Probar Vosk con el WAV generado')
-    parser.add_argument('--test-gain', action='store_true',
-                        help='Buscar gain optimo automaticamente')
-    parser.add_argument('--gain', type=float, default=GAIN_DEFAULT,
-                        help=f'Gain para sox (default: {GAIN_DEFAULT})')
-    parser.add_argument('--duration', type=int, default=PIPELINE_DURATION,
-                        help=f'Duracion de grabacion en segundos (default: {PIPELINE_DURATION})')
+                        help='Probar Vosk con WAV en /tmp/test_audio.wav')
+    parser.add_argument('--test-realtime', action='store_true',
+                        help='Test completo en tiempo real')
+    parser.add_argument('--duration', type=int, default=TEST_DURATION,
+                        help=f'Duracion del test (default: {TEST_DURATION})')
     parser.add_argument('--model', type=str, default=MODEL_PATH,
                         help=f'Ruta al modelo Vosk (default: {MODEL_PATH})')
 
@@ -237,35 +274,26 @@ def main():
     print("  DIAGNOSTICO v3 - TELEPROMPTER PARA SORDOS")
     print("====================================================")
 
-    if args.test_gain:
-        gain = test_gain_search()
-        print(f"\n  Usar con: python3 teleprompter_v3.py --gain {gain}")
+    if args.test_realtime:
+        test_realtime(duration=args.duration, model_path=args.model)
         return
 
-    if args.test_pipeline:
-        output_file = "/tmp/test_pipeline.wav"
-        audio_data = run_pipeline(duration=args.duration, gain=args.gain, output_file=output_file)
-        if audio_data:
-            audio_np = np.frombuffer(audio_data, dtype=np.int16)
-            print()
-            print_stats(audio_np, "Audio procesado")
-            print()
-            if args.test_vosk:
-                test_vosk(wav_file=output_file, model_path=args.model)
+    if args.test_audio:
+        test_audio()
+        if args.test_vosk:
+            test_vosk(model_path=args.model)
         return
 
     if args.test_vosk:
         test_vosk(model_path=args.model)
         return
 
-    # Ningun argumento: mostrar ayuda
     parser.print_help()
     print()
     print("  Ejemplos:")
-    print("    python3 diagnostico_v2.py --test-pipeline")
-    print("    python3 diagnostico_v2.py --test-pipeline --test-vosk")
-    print("    python3 diagnostico_v2.py --test-gain")
-    print("    python3 diagnostico_v2.py --test-pipeline --gain -18")
+    print("    python3 diagnostico_v2.py --test-audio")
+    print("    python3 diagnostico_v2.py --test-audio --test-vosk")
+    print("    python3 diagnostico_v2.py --test-realtime")
 
 
 if __name__ == "__main__":
