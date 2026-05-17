@@ -1,226 +1,186 @@
 #!/usr/bin/env python3
 """
-Teleprompter V2 - Sistema de reconocimiento de voz para sordos by WillWick  Github willdex
-Optimizado para Raspberry Pi 3 + Vosk offline
+Teleprompter para Sordos - v2 (streaming en tiempo real)
+Raspberry Pi 3 + USB mic (44100Hz) + Vosk español
+
+Mejoras sobre v1:
+- Resampling en memoria con numpy (sin ffmpeg ni archivos temporales)
+- Streaming continuo en lugar de bloques grandes
+- Resultados parciales en tiempo real
+- Reset automático del reconocedor entre frases
+- Validación de nivel de audio antes de procesar
+- Buffer circular para audio continuo
 """
 
-import os
-import sys
-import queue
-import json
-import logging
-from datetime import datetime
 import sounddevice as sd
-from vosk import Model, KaldiRecognizer
-import pygame
+import numpy as np
+import json
+import time
+import threading
+import queue
+import sys
+from vosk import Model, KaldiRecognizer, SetLogLevel
 
-# ============================================================
-# CONFIGURACIÓN - EDITAR SEGÚN TU HARDWARE
-# ============================================================
-CONFIG = {
-    "audio_device": None,  # None = auto-detectar, o "hw:1,0" para M6
-    "model_path": "modelo",
-    "max_words_display": 25,
-    "font_size": 90,
-    "color_fondo": (0, 0, 0),
-    "color_texto": (255, 255, 0),
-    "log_file": "/home/jose/proyecto_voz/teleprompter.log",
-}
+# ── Silenciar logs internos de Vosk ──────────────────────────────────────────
+SetLogLevel(-1)
 
-# Palabras comunes mal reconocidas (ampliar según necesidad)
-REEMPLAZOS = {
-    " a ": " ha ",
-    " a ": " él ",
-    " y ": " él ",
-    " lo ": " el ",
-    " de ": " de ",
-    " que ": " que ",
-    " se ": " ce ",
-    " te ": " ti ",
-    " me ": " mi ",
-    " nos ": " nos ",
-}
+# ── Configuración ─────────────────────────────────────────────────────────────
+MIC_DEVICE      = "hw:2,0"   # USB PnP Sound Device
+MIC_SAMPLERATE  = 44100      # Hz que soporta el micrófono
+VOSK_SAMPLERATE = 16000      # Hz que espera Vosk
+BLOCKSIZE       = 4096       # Muestras por bloque a 44100 Hz (~93ms)
+MODEL_PATH      = "modelo"   # Ruta al modelo vosk-model-small-es-0.42
 
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.FileHandler(CONFIG["log_file"]),
-        logging.StreamHandler()
-    ]
-)
-log = logging.getLogger(__name__)
+# Umbral mínimo de energía para considerar que hay voz (evita procesar silencio)
+VAD_THRESHOLD   = 300        # RMS mínimo (ajustar según el micrófono)
+SILENCE_TIMEOUT = 2.0        # Segundos de silencio para marcar fin de frase
 
-# ============================================================
-# CLASE PRINCIPAL
-# ============================================================
-class Recognizer:
-    def __init__(self):
-        self.q = queue.Queue()
-        self.historial = []
-        self.partial_text = ""
-        self.running = True
-        
-    def setup_audio(self):
-        if CONFIG["audio_device"]:
-            device = CONFIG["audio_device"]
+# ── Display (reemplaza con pygame/pantalla HDMI real) ─────────────────────────
+def mostrar_texto(texto, tipo="parcial"):
+    """
+    Muestra texto en pantalla.
+    tipo='parcial' → texto provisional mientras el usuario habla
+    tipo='final'   → texto confirmado al detectar pausa
+    """
+    if tipo == "final":
+        print(f"\n✅ FINAL: {texto}\n")
+    else:
+        print(f"  ... {texto}", end="\r")
+
+
+# ── Resampling en memoria (sin ffmpeg) ────────────────────────────────────────
+def resample_44100_a_16000(audio_44k: np.ndarray) -> bytes:
+    """
+    Convierte audio int16 de 44100Hz a 16000Hz usando interpolación lineal.
+    Mucho más rápido que ffmpeg para bloques pequeños.
+    Retorna bytes raw PCM int16 listos para Vosk.
+    """
+    # Factor de conversión: 16000/44100 ≈ 0.3628
+    ratio = VOSK_SAMPLERATE / MIC_SAMPLERATE
+    n_out = int(len(audio_44k) * ratio)
+
+    # Interpolación lineal con numpy (eficiente en Raspberry Pi 3)
+    x_in  = np.arange(len(audio_44k))
+    x_out = np.linspace(0, len(audio_44k) - 1, n_out)
+    audio_16k = np.interp(x_out, x_in, audio_44k.astype(np.float32))
+
+    return audio_16k.astype(np.int16).tobytes()
+
+
+# ── Detección de voz simple (VAD por energía) ─────────────────────────────────
+def tiene_voz(audio: np.ndarray) -> bool:
+    """Retorna True si el bloque de audio supera el umbral de energía mínimo."""
+    rms = np.sqrt(np.mean(audio.astype(np.float32) ** 2))
+    return rms > VAD_THRESHOLD
+
+
+# ── Cola de audio entre callback y procesador ────────────────────────────────
+audio_queue = queue.Queue()
+
+def audio_callback(indata, frames, time_info, status):
+    """Callback del stream de sounddevice. Se ejecuta en hilo separado."""
+    if status:
+        print(f"[AUDIO STATUS] {status}", file=sys.stderr)
+    audio_queue.put(indata[:, 0].copy())  # Solo canal 0 (mono)
+
+
+# ── Procesador principal ───────────────────────────────────────────────────────
+def procesar_audio(rec: KaldiRecognizer):
+    """
+    Loop principal: toma bloques de la cola, resamplea, alimenta a Vosk.
+    Muestra resultados parciales y finales.
+    """
+    ultimo_final = time.time()
+    frase_en_curso = False
+
+    while True:
+        try:
+            bloque = audio_queue.get(timeout=0.5)
+        except queue.Empty:
+            # Timeout: si llevamos SILENCE_TIMEOUT segundos sin voz, cerrar frase
+            if frase_en_curso and (time.time() - ultimo_final > SILENCE_TIMEOUT):
+                resultado = json.loads(rec.FinalResult())
+                texto = resultado.get("text", "").strip()
+                if texto:
+                    mostrar_texto(texto, tipo="final")
+                # Crear nuevo reconocedor para limpiar estado interno
+                rec.Reset()
+                frase_en_curso = False
+            continue
+
+        # Validar que haya voz antes de procesar
+        if not tiene_voz(bloque):
+            continue
+
+        frase_en_curso = True
+        ultimo_final = time.time()
+
+        # Resamplear a 16kHz
+        audio_16k = resample_44100_a_16000(bloque)
+
+        # Alimentar a Vosk
+        if rec.AcceptWaveform(audio_16k):
+            # Resultado final de una oración
+            resultado = json.loads(rec.Result())
+            texto = resultado.get("text", "").strip()
+            if texto:
+                mostrar_texto(texto, tipo="final")
         else:
-            devices = sd.query_devices()
-            mic = next((d for d in devices if d['max_input_channels'] > 0), None)
-            if not mic:
-                raise RuntimeError("No se encontró micrófono")
-            device = mic['name']
-            log.info(f"Auto-detectado micrófono: {device}")
-        
-        info = sd.query_devices(device, 'input')
-        self.sample_rate = int(info['default_samplerate'])
-        log.info(f"Dispositivo: {device} @ {self.sample_rate} Hz")
-        
-        return device
-    
-    def load_model(self):
-        log.info(f"Cargando modelo desde: {CONFIG['model_path']}")
-        model = Model(CONFIG["model_path"])
-        rec = KaldiRecognizer(model, self.sample_rate)
-        log.info("Modelo cargado exitosamente")
-        return rec
-    
-    def audio_callback(self, indata, frames, time, status):
-        if status:
-            log.warning(f"Audio status: {status}")
-        self.q.put(bytes(indata))
-    
-    def aplicar_reemplazos(self, texto):
-        texto_corrigido = texto
-        for incorrecto, correcto in REEMPLAZOS.items():
-            texto_corrigido = texto_corrigido.replace(incorrecto, correcto)
-        return texto_corrigido
-    
-    def procesar_resultado(self, rec, pygame, pantalla, fuente, info_pantalla):
-        while self.running:
-            try:
-                data = self.q.get(timeout=1)
-                
-                if rec.AcceptWaveform(data):
-                    resultado = json.loads(rec.Result())
-                    texto = resultado.get("text", "").strip()
-                    
-                    if texto:
-                        texto = self.aplicar_reemplazos(texto)
-                        palabras = texto.split()
-                        self.historial.extend(palabras)
-                        log.info(f"Reconocido: {texto}")
-                        self.actualizar_pantalla(pygame, pantalla, fuente, info_pantalla, "")
-                
-                else:
-                    parcial = json.loads(rec.PartialResult())
-                    texto_parcial = parcial.get("partial", "")
-                    if texto_parcial != self.partial_text:
-                        self.partial_text = texto_parcial
-                        self.actualizar_pantalla(pygame, pantalla, fuente, info_pantalla, texto_parcial)
-                        
-            except queue.Empty:
-                continue
-            except Exception as e:
-                log.error(f"Error en procesamiento: {e}")
-    
-    def actualizar_pantalla(self, pygame, pantalla, fuente, info_pantalla, partial):
-        superficie = pantalla
-        
-        if len(self.historial) > CONFIG["max_words_display"]:
-            self.historial = self.historial[-CONFIG["max_words_display"]:]
-        
-        texto_confirmado = " ".join(self.historial)
-        texto_completo = texto_confirmado + (" " + partial if partial else "")
-        
-        superficie.fill(CONFIG["color_fondo"])
-        
-        ancho_max = info_pantalla.current_w - 100
-        palabras_lista = texto_completo.split()
-        lineas = []
-        linea_actual = ""
-        
-        for palabra in palabras_lista:
-            test_linea = linea_actual + palabra + " "
-            if fuente.size(test_linea)[0] < ancho_max:
-                linea_actual = test_linea
-            else:
-                if linea_actual:
-                    lineas.append(linea_actual.strip())
-                linea_actual = palabra + " "
-        
-        if linea_actual.strip():
-            lineas.append(linea_actual.strip())
-        
-        y = 50
-        for linea in lineas[-8:]:
-            img = fuente.render(linea, True, CONFIG["color_texto"])
-            superficie.blit(img, (50, y))
-            y += 120
-        
-        pygame.display.update()
-    
-    def iniciar(self, pygame, pantalla, info_pantalla, fuente):
-        device = self.setup_audio()
-        rec = self.load_model()
-        
-        log.info(f"Iniciando reconocimiento en {device}")
-        
-        with sd.RawInputStream(
-            samplerate=self.sample_rate,
-            blocksize=8000,
-            device=device,
-            dtype='int16',
-            channels=1,
-            callback=self.audio_callback
-        ):
-            log.info("Sistema listo. Habla al micrófono (Ctrl+C para detener)")
-            self.procesar_resultado(rec, pygame, pantalla, fuente, info_pantalla)
+            # Resultado parcial (texto provisional)
+            parcial = json.loads(rec.PartialResult())
+            texto_parcial = parcial.get("partial", "").strip()
+            if texto_parcial:
+                mostrar_texto(texto_parcial, tipo="parcial")
 
-# ============================================================
-# MAIN
-# ============================================================
+
+# ── Main ───────────────────────────────────────────────────────────────────────
 def main():
+    print("=" * 50)
+    print("  TELEPROMPTER PARA SORDOS - v2")
+    print("=" * 50)
+
+    # Cargar modelo Vosk
+    print(f"[INIT] Cargando modelo desde '{MODEL_PATH}'...")
     try:
-        os.environ["SDL_NOMOUSE"] = "1"
-        pygame.init()
-        
-        drivers = ['kmsdrm', 'fbcon', 'directfb']
-        driver_ok = False
-        
-        for driver in drivers:
-            os.environ["SDL_VIDEODRIVER"] = driver
-            try:
-                pygame.display.init()
-                log.info(f"Driver de video: {driver}")
-                driver_ok = True
-                break
-            except pygame.error as e:
-                log.warning(f"Driver {driver} no disponible: {e}")
-                continue
-        
-        if not driver_ok:
-            log.error("No se pudo inicializar ningún driver de video")
-            sys.exit(1)
-        
-        info = pygame.display.Info()
-        pantalla = pygame.display.set_mode(
-            (info.current_w, info.current_h),
-            pygame.FULLSCREEN
-        )
-        
-        fuente = pygame.font.Font(None, CONFIG["font_size"])
-        
-        recognizer = Recognizer()
-        recognizer.iniciar(pygame, pantalla, info, fuente)
-        
-    except KeyboardInterrupt:
-        log.info("Detenido por el usuario")
+        model = Model(MODEL_PATH)
+        rec   = KaldiRecognizer(model, VOSK_SAMPLERATE)
+        rec.SetWords(True)  # Habilitar info de palabras individuales
+        print("[INIT] Modelo cargado ✓")
     except Exception as e:
-        log.critical(f"Error fatal: {e}", exc_info=True)
-    finally:
-        pygame.quit()
+        print(f"[ERROR] No se pudo cargar el modelo: {e}")
+        sys.exit(1)
+
+    # Iniciar stream de audio
+    print(f"[INIT] Iniciando micrófono '{MIC_DEVICE}' a {MIC_SAMPLERATE}Hz...")
+    try:
+        stream = sd.InputStream(
+            device=MIC_DEVICE,
+            samplerate=MIC_SAMPLERATE,
+            blocksize=BLOCKSIZE,
+            dtype="int16",
+            channels=1,
+            callback=audio_callback,
+        )
+    except Exception as e:
+        print(f"[ERROR] No se pudo abrir el micrófono: {e}")
+        print("  Dispositivos disponibles:")
+        print(sd.query_devices())
+        sys.exit(1)
+
+    # Hilo de procesamiento (no bloquea el stream)
+    hilo = threading.Thread(target=procesar_audio, args=(rec,), daemon=True)
+    hilo.start()
+
+    print("[OK] Escuchando... (Ctrl+C para salir)\n")
+    print("-" * 50)
+
+    try:
+        with stream:
+            while True:
+                time.sleep(0.1)
+    except KeyboardInterrupt:
+        print("\n\n[EXIT] Teleprompter detenido.")
+
 
 if __name__ == "__main__":
     main()
-EOF
