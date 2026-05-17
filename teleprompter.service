@@ -1,0 +1,14 @@
+[Unit]
+Description=Vosk Teleprompter para sordos
+After=network.target
+
+[Service]
+Type=simple
+User=jose
+WorkingDirectory=/home/jose/proyecto_voz/vosk_teleprompter
+ExecStart=/home/jose/proyecto_voz/vosk_teleprompter/venv/bin/python3 /home/jose/proyecto_voz/vosk_teleprompter/teleprompter.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
