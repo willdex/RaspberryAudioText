@@ -1,34 +1,52 @@
 #!/usr/bin/env python3
 """
 teleprompter_v3.py - Sistema de reconocimiento de voz para sordos
-Pipeline: sounddevice (callback) -> scipy resample -> Vosk
+Pipeline: arecord -> sox (cirugia de audio) -> Vosk
 
 Uso:
     python3 teleprompter_v3.py
-    python3 teleprompter_v3.py --verbose
+    python3 teleprompter_v3.py --gain -30 --verbose
     python3 teleprompter_v3.py --test 15
 """
 
 import sys
 import os
 import argparse
+import subprocess
 import signal
+import threading
+import queue
 import json
 import time
 import numpy as np
-from scipy.signal import resample
-import sounddevice as sd
 from vosk import Model, KaldiRecognizer, SetLogLevel
 
 SetLogLevel(-1)
 
 # --- Constantes ---
-SAMPLE_RATE_DEV = 44100
-SAMPLE_RATE_VOSK = 16000
-BLOCK_SIZE = 4410  # 100ms
+MIC_DEVICE = "plughw:2,0"
+MIC_SAMPLERATE = 44100
+VOSK_SAMPLERATE = 16000
 MODEL_PATH = "modelo"
-VAD_THRESHOLD = 150
+VAD_THRESHOLD = 80
 SILENCE_TIMEOUT = 1.5
+CHUNK_SIZE = 3200  # 100ms @ 16kHz
+
+
+# --- Configuracion ALSA ---
+def config_alsa():
+    """Configura ALSA al inicio: volumen minimo y AGC off."""
+    cmds = [
+        ['amixer', '-c', '2', 'cset', 'numid=3', '1'],
+        ['amixer', '-c', '2', 'sset', 'Mic', '1'],
+        ['amixer', '-c', '2', 'sset', 'Capture', '1'],
+        ['amixer', '-c', '2', 'sset', 'Auto Gain Control', 'off'],
+    ]
+    for cmd in cmds:
+        try:
+            subprocess.run(cmd, capture_output=True, timeout=5)
+        except Exception:
+            pass
 
 
 # --- Utilidades ---
@@ -40,95 +58,208 @@ def max_val(audio: np.ndarray) -> int:
     return int(np.max(np.abs(audio)))
 
 
+def dc_offset(audio: np.ndarray) -> float:
+    return float(np.mean(audio.astype(np.float32)))
+
+
 def clipping_percent(audio: np.ndarray, threshold=30000) -> float:
     clipped = np.sum(np.abs(audio) >= threshold)
     return clipped / len(audio) * 100
 
 
-# --- Clase Teleprompter ---
-class Teleprompter:
+# --- Clase AudioPipeline ---
+class AudioPipeline:
+    """
+    Maneja el pipeline arecord -> sox (cirugia de audio).
+    Lee audio de sox.stdout en bloques y los pone en una cola.
+    """
+
+    def __init__(self, device=MIC_DEVICE, gain=-30, sample_rate=MIC_SAMPLERATE):
+        self.device = device
+        self.gain = gain
+        self.sample_rate = sample_rate
+        self.process = None
+        self.sox_process = None
+        self.running = False
+        self.queue = queue.Queue(maxsize=200)
+        self.reader_thread = None
+
+    def build_arecord_cmd(self):
+        return [
+            'arecord', '-D', self.device,
+            '-f', 'S16_LE',
+            '-r', str(self.sample_rate),
+            '-c', '1',
+            '-t', 'raw',
+            '-'
+        ]
+
+    def build_sox_cmd(self):
+        return [
+            'sox', '-t', 'raw', '-r', str(self.sample_rate),
+            '-e', 'signed', '-b', '16', '-c', '1', '-',
+            '-t', 'raw', '-r', '16000',
+            '-e', 'signed', '-b', '16', '-c', '1',
+            'highpass', '100',
+            'gain', str(self.gain),
+            'highpass', '200',
+            'lowpass', '3000',
+            '-'
+        ]
+
+    def start(self):
+        """Inicia el pipeline arecord | sox."""
+        print(f"  [Pipeline] arecord -> sox (gain={self.gain})")
+
+        try:
+            self.process = subprocess.Popen(
+                self.build_arecord_cmd(),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL
+            )
+
+            self.sox_process = subprocess.Popen(
+                self.build_sox_cmd(),
+                stdin=self.process.stdout,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL
+            )
+
+            self.process.stdout.close()
+
+        except Exception as e:
+            print(f"  [Pipeline] ERROR: {e}")
+            return False
+
+        self.running = True
+        self.reader_thread = threading.Thread(target=self._reader_loop, daemon=True)
+        self.reader_thread.start()
+        print("  [Pipeline] Iniciado")
+        return True
+
+    def _reader_loop(self):
+        """Lee del pipe de sox y pone bloques en la cola."""
+        buffer = b''
+
+        while self.running:
+            try:
+                data = self.sox_process.stdout.read(8192)
+                if not data:
+                    break
+                buffer += data
+
+                while len(buffer) >= CHUNK_SIZE:
+                    chunk = buffer[:CHUNK_SIZE]
+                    buffer = buffer[CHUNK_SIZE:]
+                    try:
+                        self.queue.put(chunk, timeout=0.5)
+                    except queue.Full:
+                        pass
+
+            except Exception:
+                break
+
+    def read(self, timeout=1.0):
+        """Lee un chunk de audio de la cola."""
+        try:
+            return self.queue.get(timeout=timeout)
+        except queue.Empty:
+            return None
+
+    def stop(self):
+        """Detiene el pipeline."""
+        self.running = False
+
+        if self.process:
+            self.process.terminate()
+            try:
+                self.process.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                self.process.kill()
+
+        if self.sox_process:
+            self.sox_process.terminate()
+            try:
+                self.sox_process.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                self.sox_process.kill()
+
+        if self.reader_thread:
+            self.reader_thread.join(timeout=3)
+
+
+# --- Clase Recognizer ---
+class Recognizer:
+    """
+    Consume audio del pipeline y lo envia a Vosk.
+    """
+
     def __init__(self, model_path=MODEL_PATH, vad_threshold=VAD_THRESHOLD,
-                 silence_timeout=SILENCE_TIMEOUT, verbose=False, test_duration=None,
-                 device=None):
+                 silence_timeout=SILENCE_TIMEOUT, verbose=False):
         self.model_path = model_path
         self.vad_threshold = vad_threshold
         self.silence_timeout = silence_timeout
         self.verbose = verbose
-        self.test_duration = test_duration
-        self.device = device
-
         self.model = None
         self.rec = None
-        self.stream = None
         self.running = False
-
         self.historial = []
         self.ultimo_tiempo_voz = 0
         self.frase_activa = False
-        self.chunk_count = 0
 
     def load_model(self):
+        """Carga el modelo Vosk."""
         print(f"  [Vosk] Cargando modelo '{self.model_path}'...")
         try:
             self.model = Model(self.model_path)
-            self.rec = KaldiRecognizer(self.model, SAMPLE_RATE_VOSK)
+            self.rec = KaldiRecognizer(self.model, VOSK_SAMPLERATE)
             print("  [Vosk] Modelo cargado")
             return True
         except Exception as e:
             print(f"  [Vosk] ERROR: {e}")
             return False
 
-    def find_mic(self):
-        if self.device is not None:
-            return self.device
+    def process(self, audio_source):
+        """Bucle principal de reconocimiento."""
+        self.running = True
+        print("  [Vosk] Escuchando...")
 
-        for i, dev in enumerate(sd.query_devices()):
-            if 'USB' in dev['name'] and dev['max_input_channels'] > 0:
-                print(f"  [Audio] Micrófono USB encontrado: {i} - {dev['name']}")
-                return i
+        while self.running:
+            audio = audio_source.read(timeout=0.5)
+            if audio is None:
+                continue
 
-        print("  [Audio] ERROR: No se encontró micrófono USB")
-        return None
+            audio_np = np.frombuffer(audio, dtype=np.int16)
+            energia = rms(audio_np)
+            max_audio = max_val(audio_np)
 
-    def resample_audio(self, chunk_44100):
-        num_out = int(len(chunk_44100) * SAMPLE_RATE_VOSK / SAMPLE_RATE_DEV)
-        resampled = resample(chunk_44100.astype(np.float32), num_out)
-        return np.clip(resampled, -32768, 32767).astype(np.int16)
+            if self.verbose and energia > 0:
+                dc = dc_offset(audio_np)
+                clip_pct = clipping_percent(audio_np)
+                print(f"\r  RMS: {energia:6.1f}  Max: {max_audio:6d}  DC: {dc:7.1f}  Clip: {clip_pct:5.2f}%",
+                      end="", flush=True)
 
-    def audio_callback(self, indata, frames, time_info, status):
-        if status:
-            print(f"  [Audio] status: {status}")
+            hay_voz = energia > self.vad_threshold
 
-        chunk_44100 = indata[:, 0].astype(np.int16)
-        chunk_16000 = self.resample_audio(chunk_44100)
-        self.chunk_count += 1
+            if hay_voz:
+                self.ultimo_tiempo_voz = time.time()
+                self.frase_activa = True
+            elif self.frase_activa and (time.time() - self.ultimo_tiempo_voz > self.silence_timeout):
+                self._fin_frase()
+                self.frase_activa = False
 
-        energia = np.abs(chunk_44100).mean()
-        hay_voz = energia > self.vad_threshold
-
-        if hay_voz:
-            self.ultimo_tiempo_voz = time.time()
-            self.frase_activa = True
-        elif self.frase_activa and (time.time() - self.ultimo_tiempo_voz > self.silence_timeout):
-            self._fin_frase()
-            self.frase_activa = False
-
-        if self.verbose and self.chunk_count % 10 == 0:
-            clip_pct = clipping_percent(chunk_44100)
-            print(f"\r  [{self.chunk_count*0.1:.1f}s] RMS: {energia:6.0f}  Max: {max_val(chunk_44100):6d}  Clip%: {clip_pct:5.2f}",
-                  end="", flush=True)
-
-        if self.rec.AcceptWaveform(chunk_16000.tobytes()):
-            resultado = json.loads(self.rec.Result())
-            texto = resultado.get("text", "").strip()
-            if texto and len(texto) > 1:
-                print(f"\n  [parcial] {texto}", end="", flush=True)
-        else:
-            parcial = json.loads(self.rec.PartialResult()).get("partial", "")
-            if parcial and len(parcial) > 2:
-                print(f"\r  ... {parcial}", end="", flush=True)
+            if self.rec.AcceptWaveform(audio):
+                resultado = json.loads(self.rec.Result())
+                texto = resultado.get("text", "").strip()
+                if texto and len(texto) > 1:
+                    print(f"\n  [parcial] {texto}", end="", flush=True)
+            else:
+                parcial = json.loads(self.rec.PartialResult()).get("partial", "")
+                if parcial and len(parcial) > 2:
+                    print(f"\r  ... {parcial}", end="", flush=True)
 
     def _fin_frase(self):
+        """Imprime frase completa al detectar silencio."""
         resultado = json.loads(self.rec.FinalResult())
         texto = resultado.get("text", "").strip()
         if texto:
@@ -136,34 +267,46 @@ class Teleprompter:
             print(f"\n  >>> {texto}")
         self.rec.Reset()
 
+    def stop(self):
+        self.running = False
+
+    def get_historial(self):
+        return self.historial
+
+
+# --- Clase Teleprompter ---
+class Teleprompter:
+    """Orquesta los componentes principales."""
+
+    def __init__(self, gain=-30, vosk_model=MODEL_PATH, verbose=False, test_duration=None):
+        self.gain = gain
+        self.vosk_model = vosk_model
+        self.verbose = verbose
+        self.test_duration = test_duration
+        self.pipeline = None
+        self.recognizer = None
+
     def start(self):
         print("=" * 55)
         print("  TELEPROMPTER PARA SORDOS - v3")
+        print("  CIRUGIA DE AUDIO")
         print("=" * 55)
         print()
 
-        if not self.load_model():
+        config_alsa()
+
+        self.pipeline = AudioPipeline(gain=self.gain)
+        if not self.pipeline.start():
             return False
 
-        dev_id = self.find_mic()
-        if dev_id is None:
+        self.recognizer = Recognizer(
+            model_path=self.vosk_model,
+            verbose=self.verbose
+        )
+        if not self.recognizer.load_model():
             return False
 
-        print(f"  [Audio] Iniciando stream ({SAMPLE_RATE_DEV}Hz -> {SAMPLE_RATE_VOSK}Hz)...")
-
-        try:
-            self.stream = sd.InputStream(
-                device=dev_id,
-                samplerate=SAMPLE_RATE_DEV,
-                blocksize=BLOCK_SIZE,
-                dtype='int16',
-                channels=1,
-                callback=self.audio_callback
-            )
-        except Exception as e:
-            print(f"  [Audio] ERROR: {e}")
-            return False
-
+        print()
         print("  Sistema listo. Escuchando...")
         print("  Ctrl+C para salir")
         print("-" * 55)
@@ -176,29 +319,22 @@ class Teleprompter:
             timer.start()
 
         try:
-            with self.stream:
-                sd.sleep(self.test_duration * 1000 if self.test_duration else 86400000)
+            self.recognizer.process(self.pipeline)
         except KeyboardInterrupt:
             self.stop()
 
     def stop(self):
-        self.running = False
-        if self.stream:
-            self.stream.close()
-            self.stream = None
+        print("\n\n  Deteniendo...")
+        if self.recognizer:
+            self.recognizer.stop()
+        if self.pipeline:
+            self.pipeline.stop()
 
-        if self.rec:
-            final = json.loads(self.rec.FinalResult())
-            texto = final.get("text", "").strip()
-            if texto:
-                self.historial.append(texto)
-
-        print("\n")
-        print("=" * 55)
-        print(f"  RESUMEN: {len(self.historial)} frases")
-        print("=" * 55)
-        for i, texto in enumerate(self.historial):
-            print(f"  {i+1}. {texto}")
+        historial = self.recognizer.get_historial() if self.recognizer else []
+        if historial:
+            print("\n  Resumen:")
+            for texto in historial:
+                print(f"    - {texto}")
 
 
 # --- Signal Handler ---
@@ -207,22 +343,18 @@ def signal_handler(signum, frame):
 
 
 # --- Main ---
-import threading
-
 def main():
     parser = argparse.ArgumentParser(description="Teleprompter v3 - Reconocimiento de voz para sordos")
+    parser.add_argument('--gain', type=float, default=-30,
+                        help='Atenuacion de sox en dB (default: -30)')
     parser.add_argument('--vosk-model', type=str, default=MODEL_PATH,
                         help='Ruta al modelo Vosk (default: modelo)')
     parser.add_argument('--vad-threshold', type=int, default=VAD_THRESHOLD,
                         help=f'Umbral VAD RMS (default: {VAD_THRESHOLD})')
-    parser.add_argument('--silence-timeout', type=float, default=SILENCE_TIMEOUT,
-                        help=f'Segundos de silencio para fin de frase (default: {SILENCE_TIMEOUT})')
     parser.add_argument('--verbose', action='store_true',
-                        help='Imprimir RMS y Max del audio procesado')
+                        help='Imprimir RMS, Max, DC y Clip del audio procesado')
     parser.add_argument('--test', type=int, metavar='SEGUNDOS',
                         help='Modo test: ejecutar por N segundos y salir')
-    parser.add_argument('--device', type=int, default=None,
-                        help='ID del dispositivo de audio')
 
     args = parser.parse_args()
 
@@ -230,12 +362,10 @@ def main():
     signal.signal(signal.SIGTERM, signal_handler)
 
     tp = Teleprompter(
-        model_path=args.vosk_model,
-        vad_threshold=args.vad_threshold,
-        silence_timeout=args.silence_timeout,
+        gain=args.gain,
+        vosk_model=args.vosk_model,
         verbose=args.verbose,
-        test_duration=args.test,
-        device=args.device
+        test_duration=args.test
     )
 
     if not tp.start():
